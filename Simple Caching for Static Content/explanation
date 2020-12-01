@@ -1,0 +1,135 @@
+Creating a Cache Using fastcgi_cache_path
+
+When we make requests to an application, sometimes the content doesn’t change at all, 
+but in our current reverse-proxy setup we would still pass the request over to the application.
+We can prevent our application servers from receiving this extra load by having NGINX cache responses
+and serve that data back when the request matches. NGINX has a powerful caching mechanism built into it 
+and works almost exactly the same regardless of whether you’re using proxy_pass, fastcgi_pass, or uwsgi_pass to proxy 
+to another server. Each of the proxy modules that we’ve looked at so far has equivalent caching directives. 
+We’re going to investigate caching by looking at our WordPress application. Let’s add a simple cache by editing /etc/nginx/conf.d/blog.example.com.conf:
+
+/etc/nginx/conf.d/blog.example.com.conf
+
+
+
+The first thing to notice is that we had to specify the properties and name of our cache using the fastcgi_cache_path directive. There are a lot of arguments to this directive, so see what they each do:
+
+/var/cache/nginx/blog - specifies the directory to store the cached objects
+levels=1:2 - specifies the number of subdirectory levels used in the cache. This is the recommended setting, yet not the default
+keys_zone=blog:10m - Allows us to specify the name of the cache and the size of the memory space that will hold the keys and metadata information. The name and size of the lookup table so NGINX can quickly know if a request is a cache hit or miss
+max_size=1g - Defines the maximum amount of storage we’re allowing NGINX to use for this cache. If not set it will keep caching new keys only limited by storage
+inactive=60m - Defines the maximum cache lifetime of an item if it’s not accessed again. The cache will be populated on the first hit, and then after that, it will have 60 minutes to receive another request or the item will be removed from the cache
+We’ve specified where to cache things, but for fastcgi and uwsgi caching we’ll need to also specify the cache key using the appropriate _cache_key directive. Our cache key is created from the requests scheme, host, method (GET | POST | etc), and request URI.
+
+To see the fruits of the caching, we’re best off to open our browser’s developer tools to look at the network response time and response headers (right-click the page select “Inspect Element” then open the “Network” tab). We’ll reload the page after opening the network tab to see how long each request takes. This gives us the non-cached speed. Now we can reload NGINX before reloading the page to see the difference.
+
+[root] $ systemctl reload nginx
+Adding Additional Cache Header
+
+It’s really helpful to know if our request was a cache hit or cache miss. We can display this in the browser’s response information by adding an additional header within our location block. NGINX provides an upstream_cache_status variable that indicates whether the current request is a cache hit or miss. We can set this value as a header using the add_header directive. Let’s add this now:
+
+/etc/nginx/conf.d/blog.example.com.conf
+
+___________________________
+
+
+fastcgi_cache_path /var/cache/nginx/blog levels=1:2
+                   keys_zone=blog:10m max_size=1g inactive=60m;
+
+server {
+    listen 80;
+    server_name blog.example.com;
+
+
+root /var/www/blog.example.com;
+index index.php;
+
+fastcgi_cache_key $scheme$request_method$host$request_uri;
+
+location / {
+    try_files $uri $uri/ /index.php?$args;
+}
+
+location ~ \.php$ {
+    add_header X-Cache-Status $upstream_cache_status;
+    fastcgi_index index.php;
+    fastcgi_pass unix:/var/run/php-fpm.sock;
+    fastcgi_cache blog;
+    fastcgi_cache_valid 60m;
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+}
+
+}
+
+
+
+___________________________
+
+Now when we look at the response headers. We’ll see either “X-Cache-Status: MISS” or “X-Cache-Status: HIT”. This makes debugging caching issues a lot easier.
+
+Not Caching Content
+
+Caching the content of our blog is great, but we don’t want to cache more dynamic content like the admin area of WordPress. Let’s see if what we’ve currently got will cache the admin dashboard pages by going to blog.example.com/wp-login.php. Our “X-Cache-Status” shows a “MISS” the first time, but if we reload the page it doesn’t change to a “HIT”. Why not? NGINX caches responses that are valid, but the proxied server can ensure that it doesn’t happen by returning a “Cache-Control” header that includes “no-cache”.
+
+If we would rather not cache some content without relying on the proxied application, 
+we can do so by creating a more specific location block that doesn’t use fastcgi_cache.
+There are also conditionals and variables that we can use to indicate whether we’d like to bypass the cache.
+Here’s an example of how we could bypass the cache if the request includes /wp-admin:
+
+/etc/nginx/conf.d/blog.example.com.conf
+
+__________________________________________
+
+fastcgi_cache_path /var/cache/nginx/blog levels=1:2
+                   keys_zone=blog:10m max_size=1g inactive=60m;
+
+server {
+    listen 80;
+    server_name blog.example.com;
+
+
+root /var/www/blog.example.com;
+index index.php;
+
+fastcgi_cache_key $scheme$request_method$host$request_uri;
+
+set $skip_cache 0;
+
+if ($request_uri ~* "/wp-admin") {
+    set $skip_cache 1;
+}
+
+location / {
+    try_files $uri $uri/ /index.php?$args;
+}
+
+location ~ \.php$ {
+    add_header X-Cache-Status $upstream_cache_status;
+    fastcgi_index index.php;
+    fastcgi_pass unix:/var/run/php-fpm.sock;
+    fastcgi_cache_bypass $skip_cache;
+    fastcgi_no_cache $skip_cache;
+    fastcgi_cache blog;
+    fastcgi_cache_valid 60m;
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+}
+
+}
+
+__________________________________________
+
+We’re using set and an if context to manipulate a variable before routing the request. If $skip_cache is set to anything other than 0, we can us it with fastcgi_cache_bypass and fastcgi_no_cache to skip checking the cache and not cache the returned response.
+
+Purging the Cache
+
+To get rid of already cached content, we have a few options:
+
+Remove files from disk within our cache directory (/var/cache/nginx/blog in our case).
+Utilizing the fastcgi_cache_purge directive.
+The first option is self-explanatory, we would use rm -rf to delete the directories under /var/cache/nginx/blog.
+The second option is more interesting and provides us with a way to programmatically purge the cache. Unfortunately,
+the documentation shows a fastcgi_cache_purge directive, but it is only part of the commercial distribution, NGINX Plus.
+
+
